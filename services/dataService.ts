@@ -3,11 +3,11 @@ import { Incident, Platform, Status, Category, DashboardMetrics } from '../types
 
 const HARDCODED_SHEET_URL = "https://docs.google.com/spreadsheets/d/1n45IKdN1vS6CQ_e7xboQ_oZhivK2QBZUOetQwaCbGFU/edit?gid=0#gid=0"; 
 const HARDCODED_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzBzmDwAjeiiigC3IFIrizcwk_NG3zqbCWGxKG9BRFliVQQLy8M1qXRv_h36az-3l-GgQ/exec"; 
-const PROXY_URL = "https://api.allorigins.win/raw?url=";
 
 const SHEET_URL_KEY = 'dr_papie_sheet_url';
 const SCRIPT_URL_KEY = 'dr_papie_script_url';
 const APIFY_TOKEN_KEY = 'dr_papie_apify_token';
+const DATA_CACHE_KEY = 'dr_papie_data_cache';
 const DEFAULT_SHEET_ID = '1n45IKdN1vS6CQ_e7xboQ_oZhivK2QBZUOetQwaCbGFU';
 
 export const convertToCsvUrl = (inputUrl: string): string => {
@@ -130,26 +130,72 @@ export const dataService = {
   setScriptUrl: (url: string) => localStorage.setItem(SCRIPT_URL_KEY, url),
 
   fetchIncidents: async (): Promise<Incident[]> => {
-    const url = dataService.getDatabaseUrl();
-    const proxiedUrl = `${PROXY_URL}${encodeURIComponent(url)}`;
-    try {
-      const response = await fetch(proxiedUrl, { 
-        method: 'GET',
-        headers: { 'Accept': 'text/csv' },
-        cache: 'no-store' 
-      });
-      if (!response.ok) throw new Error(`HTTP Error: ${response.status}`);
-      const text = await response.text();
-      
-      if (text.trim().startsWith('<!DOCTYPE html>')) {
-          throw new Error("Dữ liệu trả về là HTML (vui lòng kiểm tra quyền chia sẻ của Sheet).");
-      }
-      
-      return parseCSV(text);
-    } catch (error) {
-      console.error("Fetch failure:", error);
-      throw error;
+    let url = dataService.getDatabaseUrl();
+    
+    // Add timestamp to prevent caching at the proxy level
+    if (url.includes('docs.google.com')) {
+         url += (url.includes('?') ? '&' : '?') + `_t=${Date.now()}`;
     }
+
+    // List of proxies to try in order
+    const proxies = [
+        `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+        `https://corsproxy.io/?${encodeURIComponent(url)}`,
+        `https://thingproxy.freeboard.io/fetch/${url}`
+    ];
+
+    let lastError;
+
+    for (const proxyUrl of proxies) {
+        try {
+            console.log(`Attempting fetch via ${proxyUrl.substring(0, 30)}...`);
+            const response = await fetch(proxyUrl, { 
+                method: 'GET',
+                cache: 'no-store' 
+            });
+            
+            if (!response.ok) {
+                console.warn(`Proxy fetch failed with status: ${response.status}`);
+                continue;
+            }
+            
+            const text = await response.text();
+            
+            // Validate content is not HTML error page
+            if (text.trim().startsWith('<!DOCTYPE html>') || text.length < 50) {
+                console.warn("Received HTML or empty response instead of CSV.");
+                continue;
+            }
+
+            const data = parseCSV(text);
+            
+            // Cache successful response
+            try {
+                localStorage.setItem(DATA_CACHE_KEY, JSON.stringify(data));
+            } catch (e) {
+                console.warn("Failed to update cache", e);
+            }
+
+            return data;
+        } catch (error) {
+            console.warn("Proxy fetch attempt error:", error);
+            lastError = error;
+        }
+    }
+
+    // Fallback: Try to load from local storage cache if network fails completely
+    const cachedData = localStorage.getItem(DATA_CACHE_KEY);
+    if (cachedData) {
+        console.warn("All proxies failed. Serving cached data.");
+        try {
+            return JSON.parse(cachedData);
+        } catch (e) {
+            console.error("Cache corrupted.");
+        }
+    }
+
+    console.error("All proxies failed and no cache available.");
+    throw lastError || new Error("Failed to fetch data from all available proxies. Please check your internet connection.");
   },
 
   addIncidents: async (currentData: Incident[], newIncidents: Incident[]): Promise<Incident[]> => {
